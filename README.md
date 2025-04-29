@@ -1,6 +1,8 @@
 Scalable Web Application Architecture on AWS
 Project Overview
+
 This project demonstrates the design and implementation of a highly scalable, fault-tolerant web application infrastructure on AWS. The architecture leverages best-in-class AWS services to create a robust platform capable of handling variable workloads while maintaining optimal performance and security.
+
 Technical Architecture
 The solution features a multi-layered approach that separates user-facing components from backend services:
 
@@ -18,6 +20,7 @@ Deployed infrastructure as code using CloudFormation, ensuring consistent and re
 Implemented security best practices with private subnets for sensitive components and properly configured security groups
 
 Business Impact
+
 This architecture provides the foundation for applications that require enterprise-grade reliability and performance. It enables rapid deployment of new features through CI/CD integration while maintaining operational excellence. The solution is designed to scale from startup to enterprise workloads without architectural redesign.
 Skills Demonstrated
 
