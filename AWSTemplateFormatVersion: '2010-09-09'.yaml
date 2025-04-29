@@ -1,0 +1,583 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for web application with Elastic Beanstalk, RDS, Memcached, and Amazon MQ'
+
+Parameters:
+  EnvironmentName:
+    Description: Environment name prefix for resources
+    Type: String
+    Default: WebApp
+
+  VpcCIDR:
+    Description: CIDR block for the VPC
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnet1CIDR:
+    Description: CIDR block for Public Subnet 1
+    Type: String
+    Default: 10.0.1.0/24
+
+  PublicSubnet2CIDR:
+    Description: CIDR block for Public Subnet 2
+    Type: String
+    Default: 10.0.2.0/24
+
+  PrivateSubnet1CIDR:
+    Description: CIDR block for Private Subnet 1
+    Type: String
+    Default: 10.0.3.0/24
+
+  PrivateSubnet2CIDR:
+    Description: CIDR block for Private Subnet 2
+    Type: String
+    Default: 10.0.4.0/24
+
+  DBName:
+    Description: MySQL database name
+    Type: String
+    Default: appdb
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+
+  DBUsername:
+    Description: Username for MySQL database
+    Type: String
+    NoEcho: true
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+
+  DBPassword:
+    Description: Password for MySQL database
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '[a-zA-Z0-9]*'
+
+  SSLCertificateArn:
+    Description: ARN of the SSL certificate for CloudFront and LoadBalancer
+    Type: String
+    Default: ''
+
+  DomainName:
+    Description: Domain name for Route 53
+    Type: String
+    Default: example.com
+
+Resources:
+  # VPC and Network Setup
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-IGW
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-PublicSubnet1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-PublicSubnet2
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-PrivateSubnet1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-PrivateSubnet2
+
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-PublicRoutes
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-PrivateRoutes1
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-PrivateRoutes2
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # Security Groups
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Elastic Beanstalk application
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS MySQL
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  MemcachedSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ElastiCache Memcached
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 11211
+          ToPort: 11211
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  MQSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Amazon MQ
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 61616
+          ToPort: 61616
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 8162
+          ToPort: 8162
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  # S3 Bucket for artifacts
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # RDS MySQL Database
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS MySQL
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: !Ref DBName
+      Engine: MySQL
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBInstanceClass: db.t3.small
+      AllocatedStorage: 20
+      StorageType: gp2
+      MultiAZ: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt DBSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-MySQL
+
+  # ElastiCache Memcached
+  MemcachedSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for ElastiCache Memcached
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  MemcachedCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      Engine: memcached
+      CacheNodeType: cache.t3.small
+      NumCacheNodes: 2
+      CacheSubnetGroupName: !Ref MemcachedSubnetGroup
+      VpcSecurityGroupIds:
+        - !GetAtt MemcachedSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-Memcached
+
+  # Amazon MQ
+  MQBroker:
+    Type: AWS::AmazonMQ::Broker
+    Properties:
+      BrokerName: !Sub ${EnvironmentName}-MQBroker
+      DeploymentMode: ACTIVE_STANDBY_MULTI_AZ
+      EngineType: ACTIVEMQ
+      EngineVersion: 5.15.0
+      HostInstanceType: mq.t3.micro
+      PubliclyAccessible: false
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroups:
+        - !GetAtt MQSecurityGroup.GroupId
+      Users:
+        - Username: !Ref DBUsername
+          Password: !Ref DBPassword
+
+  # Route 53
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref DomainName
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Aliases:
+          - !Ref DomainName
+        ViewerCertificate:
+          AcmCertificateArn: !Ref SSLCertificateArn
+          SslSupportMethod: sni-only
+        Origins:
+          - Id: ElasticBeanstalkOrigin
+            DomainName: !GetAtt ElasticBeanstalkEnvironment.EndpointURL
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+        DefaultCacheBehavior:
+          TargetOriginId: ElasticBeanstalkOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: all
+            Headers:
+              - '*'
+
+  # CloudFront Route53 Record
+  CloudFrontDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        HostedZoneId: Z2FDTNDATAQYW2 # CloudFront hosted zone ID (this is fixed)
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+
+  # Elastic Beanstalk Application
+  ElasticBeanstalkApplication:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: !Sub ${EnvironmentName}-Application
+      Description: Elastic Beanstalk Application
+
+  ElasticBeanstalkApplicationVersion:
+    Type: AWS::ElasticBeanstalk::ApplicationVersion
+    Properties:
+      ApplicationName: !Ref ElasticBeanstalkApplication
+      Description: Initial Version
+      SourceBundle:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: initial-version.zip
+
+  # Elastic Beanstalk Environment
+  ElasticBeanstalkEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref ElasticBeanstalkApplication
+      EnvironmentName: !Sub ${EnvironmentName}-Environment
+      SolutionStackName: "64bit Amazon Linux 2 v3.4.3 running Tomcat 8.5 Corretto 11"
+      Tier:
+        Name: WebServer
+        Type: Standard
+      OptionSettings:
+        # VPC Configuration
+        - Namespace: aws:ec2:vpc
+          OptionName: VPCId
+          Value: !Ref VPC
+        - Namespace: aws:ec2:vpc
+          OptionName: Subnets
+          Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+        - Namespace: aws:ec2:vpc
+          OptionName: ELBSubnets
+          Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+        # Load Balancer Configuration
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: LoadBalancerType
+          Value: application
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: ServiceRole
+          Value: aws-elasticbeanstalk-service-role
+        # Auto Scaling
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: IamInstanceProfile
+          Value: aws-elasticbeanstalk-ec2-role
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: SecurityGroups
+          Value: !Ref AppSecurityGroup
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: InstanceType
+          Value: t3.small
+        - Namespace: aws:autoscaling:asg
+          OptionName: MinSize
+          Value: 2
+        - Namespace: aws:autoscaling:asg
+          OptionName: MaxSize
+          Value: 6
+        # Environment variables
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: DB_HOST
+          Value: !GetAtt RDSInstance.Endpoint.Address
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: DB_PORT
+          Value: !GetAtt RDSInstance.Endpoint.Port
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: DB_NAME
+          Value: !Ref DBName
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: DB_USERNAME
+          Value: !Ref DBUsername
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: DB_PASSWORD
+          Value: !Ref DBPassword
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: MEMCACHED_ENDPOINT
+          Value: !GetAtt MemcachedCluster.ConfigurationEndpoint.Address
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: MEMCACHED_PORT
+          Value: !GetAtt MemcachedCluster.ConfigurationEndpoint.Port
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: MQ_ENDPOINT
+          Value: !GetAtt MQBroker.AmqpEndpoints.0
+        # Enable Enhanced Health Reporting
+        - Namespace: aws:elasticbeanstalk:healthreporting:system
+          OptionName: SystemType
+          Value: enhanced
+        # Configure CloudWatch Logs
+        - Namespace: aws:elasticbeanstalk:cloudwatch:logs
+          OptionName: StreamLogs
+          Value: true
+        - Namespace: aws:elasticbeanstalk:cloudwatch:logs
+          OptionName: DeleteOnTerminate
+          Value: false
+        - Namespace: aws:elasticbeanstalk:cloudwatch:logs
+          OptionName: RetentionInDays
+          Value: 7
+
+Outputs:
+  VPC:
+    Description: ID of the VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${EnvironmentName}-VPCID
+
+  PublicSubnets:
+    Description: List of Public Subnet IDs
+    Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+    Export:
+      Name: !Sub ${EnvironmentName}-PublicSubnets
+
+  PrivateSubnets:
+    Description: List of Private Subnet IDs
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub ${EnvironmentName}-PrivateSubnets
+
+  ApplicationURL:
+    Description: URL of the Elastic Beanstalk Environment
+    Value: !GetAtt ElasticBeanstalkEnvironment.EndpointURL
+    Export:
+      Name: !Sub ${EnvironmentName}-ApplicationURL
+
+  CloudFrontURL:
+    Description: CloudFront Distribution URL
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
+    Export:
+      Name: !Sub ${EnvironmentName}-CloudFrontURL
+
+  WebsiteURL:
+    Description: Website URL
+    Value: !Sub https://${DomainName}
+    Export:
+      Name: !Sub ${EnvironmentName}-WebsiteURL
+
+  DatabaseEndpoint:
+    Description: RDS Database Endpoint
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-DatabaseEndpoint
+
+  MemcachedEndpoint:
+    Description: Memcached Endpoint
+    Value: !GetAtt MemcachedCluster.ConfigurationEndpoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-MemcachedEndpoint
+
+  MQEndpoint:
+    Description: Amazon MQ Endpoint
+    Value: !GetAtt MQBroker.AmqpEndpoints.0
+    Export:
+      Name: !Sub ${EnvironmentName}-MQEndpoint
+
+  ArtifactsBucketName:
+    Description: S3 Bucket for Artifacts
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub ${EnvironmentName}-ArtifactsBucketName
