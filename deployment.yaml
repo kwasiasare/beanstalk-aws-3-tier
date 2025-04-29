@@ -1,0 +1,359 @@
+---
+# Deployment Pipeline for AWS Web Application
+# This file defines a CI/CD pipeline for deploying the web application
+
+version: 0.2
+
+env:
+  variables:
+    JAVA_HOME: "/usr/lib/jvm/java-11-amazon-corretto"
+    STACK_NAME: "WebApplicationStack"
+    S3_BUCKET: "webapp-deployment-artifacts"
+    TEMPLATE_FILE: "beanstalk-3-tier"
+    APPLICATION_NAME: "WebApp"
+    ENVIRONMENT_NAME: "Production"
+  parameter-store:
+    DB_USERNAME: "/webapp/database/username"
+    DB_PASSWORD: "/webapp/database/password"
+    SSL_CERTIFICATE_ARN: "/webapp/ssl/certificate-arn"
+    DOMAIN_NAME: "/webapp/domain"
+
+phases:
+  install:
+    runtime-versions:
+      java: corretto11
+    commands:
+      - echo Installing Maven...
+      - yum install -y maven
+      - echo Installing AWS CLI...
+      - pip install --upgrade awscli
+
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+      - echo Running tests...
+      - mvn test
+      - echo Building application...
+      - mvn package -DskipTests
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+
+  build:
+    commands:
+      - echo Build started on `date`
+      - echo Creating S3 bucket for artifacts if it doesn't exist...
+      - aws s3 mb s3://$S3_BUCKET --region $AWS_REGION || true
+      - echo Copying application artifacts...
+      - aws s3 cp target/*.war s3://$S3_BUCKET/webapp-$IMAGE_TAG.war
+      - echo Creating Elastic Beanstalk application version...
+      - aws elasticbeanstalk create-application-version --application-name $APPLICATION_NAME --version-label $IMAGE_TAG --source-bundle S3Bucket=$S3_BUCKET,S3Key=webapp-$IMAGE_TAG.war
+      - echo Deploying CloudFormation stack...
+      - |
+        aws cloudformation deploy \
+          --template-file $TEMPLATE_FILE \
+          --stack-name $STACK_NAME \
+          --parameter-overrides \
+            EnvironmentName=$ENVIRONMENT_NAME \
+            DBUsername=$DB_USERNAME \
+            DBPassword=$DB_PASSWORD \
+            SSLCertificateArn=$SSL_CERTIFICATE_ARN \
+            DomainName=$DOMAIN_NAME \
+          --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+          --no-fail-on-empty-changeset
+
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      - echo Updating Elastic Beanstalk environment...
+      - |
+        ENVIRONMENT_ID=$(aws cloudformation describe-stacks \
+          --stack-name $STACK_NAME \
+          --query "Stacks[0].Outputs[?OutputKey=='ElasticBeanstalkEnvironment'].OutputValue" \
+          --output text)
+        aws elasticbeanstalk update-environment \
+          --environment-id $ENVIRONMENT_ID \
+          --version-label $IMAGE_TAG
+      - echo Deployment completed successfully!
+
+artifacts:
+  files:
+    - target/*.war
+    - $TEMPLATE_FILE
+    - appspec.yml
+    - scripts/**/*
+  discard-paths: no
+
+cache:
+  paths:
+    - '/root/.m2/**/*'
+
+reports:
+  junit-reports:
+    files:
+      - 'target/surefire-reports/**/*.xml'
+    file-format: JunitXml
+
+---
+# appspec.yml - AWS CodeDeploy configuration
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /var/www/html/
+hooks:
+  BeforeInstall:
+    - location: scripts/before_install.sh
+      timeout: 300
+      runas: root
+  AfterInstall:
+    - location: scripts/after_install.sh
+      timeout: 300
+      runas: root
+  ApplicationStart:
+    - location: scripts/start_application.sh
+      timeout: 300
+      runas: root
+  ApplicationStop:
+    - location: scripts/stop_application.sh
+      timeout: 300
+      runas: root
+  ValidateService:
+    - location: scripts/validate_service.sh
+      timeout: 300
+      runas: root
+
+---
+# scripts/before_install.sh
+#!/bin/bash
+# Script executed before installation
+
+set -e
+
+# Install dependencies
+yum update -y
+yum install -y java-11-amazon-corretto-devel tomcat9
+
+# Stop tomcat if running
+service tomcat9 stop || true
+
+# Clean up the tomcat webapps directory
+rm -rf /var/lib/tomcat9/webapps/*
+
+echo "Before install completed"
+
+---
+# scripts/after_install.sh
+#!/bin/bash
+# Script executed after installation
+
+set -e
+
+# Copy the WAR file to tomcat webapps
+cp /var/www/html/*.war /var/lib/tomcat9/webapps/ROOT.war
+
+# Set correct permissions
+chown -R tomcat:tomcat /var/lib/tomcat9/webapps/
+
+# Load environment variables
+. /etc/environment
+
+echo "After install completed"
+
+---
+# scripts/start_application.sh
+#!/bin/bash
+# Script to start the application
+
+set -e
+
+# Start Tomcat
+service tomcat9 start
+
+echo "Application started"
+
+---
+# scripts/stop_application.sh
+#!/bin/bash
+# Script to stop the application
+
+set -e
+
+# Stop Tomcat
+service tomcat9 stop || true
+
+echo "Application stopped"
+
+---
+# scripts/validate_service.sh
+#!/bin/bash
+# Script to validate that the service is running correctly
+
+set -e
+
+# Wait for the application to be fully available
+sleep 30
+
+# Check if Tomcat is running
+if ! pgrep -f tomcat > /dev/null; then
+  echo "Tomcat is not running"
+  exit 1
+fi
+
+# Check if the application is responding
+HTTP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/)
+if [ "$HTTP_RESPONSE" != "200" ]; then
+  echo "Application is not responding correctly. HTTP code: $HTTP_RESPONSE"
+  exit 1
+fi
+
+echo "Service validation completed successfully"
+
+---
+# ci-cd-pipeline.yml - AWS CodePipeline configuration
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CI/CD Pipeline for Web Application'
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner
+  
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name
+  
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: GitHub repository branch
+  
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub OAuth token
+
+Resources:
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonECR-FullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonElasticBeanstalkFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess'
+        - 'arn:aws:iam::aws:policy/AWSCloudFormationFullAccess'
+  
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AWSCodeBuildAdminAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonECR-FullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonElasticBeanstalkFullAccess'
+  
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+  
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-build
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+  
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: '1'
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+              OutputArtifacts:
+                - Name: SourceCode
+        
+        - Name: Build
+          Actions:
+            - Name: BuildAndTest
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceCode
+              OutputArtifacts:
+                - Name: BuildOutput
+        
+        - Name: Deploy
+          Actions:
+            - Name: DeployToProduction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Sub ${AWS::StackName}-Production
+                TemplatePath: BuildOutput::cloudformation.yaml
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CodePipelineServiceRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "EnvironmentName": "Production",
+                    "DBUsername": "{{resolve:ssm:/webapp/database/username}}",
+                    "DBPassword": "{{resolve:ssm:/webapp/database/password}}",
+                    "SSLCertificateArn": "{{resolve:ssm:/webapp/ssl/certificate-arn}}",
+                    "DomainName": "{{resolve:ssm:/webapp/domain}}"
+                  }
+              InputArtifacts:
+                - Name: BuildOutput
+
+Outputs:
+  PipelineURL:
+    Description: URL to the CodePipeline console
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
